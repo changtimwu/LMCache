@@ -4,6 +4,30 @@
 
 When LMCache processes run on **different physical nodes** (machines), CUDA IPC cannot be used since it only works within a single machine. LMCache provides several alternative transport mechanisms for distributed KV cache sharing.
 
+## Important: GPUDirect Technologies Clarification
+
+NVIDIA's **GPUDirect** is an umbrella term for several distinct technologies:
+
+1. **GPUDirect RDMA** (for networking)
+   - **Purpose:** GPU ↔ GPU communication **over network**
+   - **Mechanism:** Direct GPU memory access over InfiniBand/RoCE, bypassing CPU
+   - **Used in LMCache:** Via NIXL library with UCX transport for P2P/PD backends
+   - **Bandwidth:** 10-100 GB/s depending on network hardware
+
+2. **GPUDirect Storage (GDS)**
+   - **Purpose:** GPU ↔ **Storage/Filesystem** I/O
+   - **Mechanism:** Direct GPU-to-disk transfers, bypassing CPU buffers
+   - **Used in LMCache:** `gds_backend.py` for local disk caching, NIXL GDS backend for file I/O
+   - **Bandwidth:** Depends on storage (NVMe: 5-15 GB/s, network storage: varies)
+
+3. **GPUDirect P2P**
+   - **Purpose:** GPU ↔ GPU within **same machine**
+   - **Mechanism:** PCIe/NVLink peer-to-peer transfers
+   - **Used in LMCache:** Indirectly via CUDA operations, not the primary cross-node mechanism
+   - **Bandwidth:** 100+ GB/s (NVLink), 10-30 GB/s (PCIe)
+
+**Key Takeaway:** When discussing cross-node GPU communication, we mean **GPUDirect RDMA**, not GDS. GDS is for storage I/O, not network transfers.
+
 ## Key Architectural Difference
 
 ### Same-Machine (Multiprocess Mode)
@@ -215,22 +239,28 @@ config.local_cpu_cache_size_gb = 10  # Optional local cache
 
 **File:** `lmcache/v1/transfer_channel/nixl_channel.py`
 
-**NIXL** (Network I/O Acceleration Library) - High-performance data transfer library
+**NIXL** (Network I/O Acceleration Library) - High-performance data transfer library built on UCX
 
 **Features:**
-- RDMA support (InfiniBand/RoCE) when available
-- GPU Direct RDMA (GDS) for GPU↔GPU over network
-- Fallback to optimized socket/file I/O
+- **RDMA support** via UCX (InfiniBand/RoCE) for GPU↔GPU over network
+- **GPUDirect RDMA** when RDMA hardware available
+- **GPU Direct Storage (GDS)** for GPU↔Disk I/O
+- Fallback to optimized socket/TCP when RDMA unavailable
 - Zero-copy transfers when possible
 
 **Supported Backends:**
 ```python
-"GDS"      # GPU Direct Storage (NVIDIA GPUDirect)
-"GDS_MT"   # Multi-threaded GDS
-"POSIX"    # Standard file I/O
+"GDS"      # GPU Direct Storage (for file I/O, not network)
+"GDS_MT"   # Multi-threaded GDS (for file I/O, not network)
+"POSIX"    # Standard POSIX file I/O
 "HF3FS"    # Hadoop filesystem
 "OBJ"      # Object storage
 ```
+
+**Network Transfers:**
+- Uses UCX transport layer underneath
+- UCX environment variable controls transport: `UCX_TLS=cuda_ipc,cuda_copy,tcp`
+- For RDMA: UCX automatically selects optimal transport (InfiniBand, RoCE, etc.)
 
 **Initialization:**
 1. Sender creates NIXL agent with buffer metadata
@@ -317,9 +347,11 @@ await nixl_agent.recv_async(buffer_ptr, size, remote_handle)
 
 ### Network Bandwidth
 - **CUDA IPC (same machine):** 100+ GB/s (PCIe/NVLink)
-- **NIXL with RDMA:** 10-100 GB/s (InfiniBand/RoCE)
+- **NIXL with GPUDirect RDMA:** 10-100 GB/s (InfiniBand/RoCE)
 - **NIXL with TCP:** 1-10 GB/s (10GbE/100GbE)
 - **HTTP/S3:** 0.1-1 GB/s (varies widely)
+
+**Note:** GPUDirect RDMA allows GPU-to-GPU transfers over RDMA networks, bypassing CPU. This is different from GPUDirect Storage (GDS), which is for GPU-to-disk I/O.
 
 ### Latency
 - **CUDA IPC:** ~10 μs
@@ -332,7 +364,7 @@ await nixl_agent.recv_async(buffer_ptr, size, remote_handle)
 | Method | Throughput | Latency | Setup Complexity | Hardware Req |
 |--------|-----------|---------|------------------|--------------|
 | CUDA IPC | Highest | Lowest | Low | Single machine |
-| NIXL+RDMA | High | Low | Medium | RDMA NICs |
+| NIXL+GPUDirect RDMA | High | Low | Medium | RDMA NICs (InfiniBand/RoCE) |
 | NIXL+TCP | Medium | Medium | Low | Standard NICs |
 | HTTP/S3 | Low | High | Low | None |
 
@@ -343,13 +375,19 @@ await nixl_agent.recv_async(buffer_ptr, size, remote_handle)
 # Worker nodes
 enable_p2p: true
 controller_pull_url: tcp://controller:6000
-nixl_backends: ["GDS"]  # Use GPU Direct Storage
+nixl_backends: ["POSIX"]  # NIXL will use UCX for network transfers (RDMA if available)
 p2p_socket_recv_timeout_ms: 5000
 p2p_socket_send_timeout_ms: 5000
+
+# Environment variable for UCX (enables RDMA)
+# UCX_TLS=rc,cuda_copy  # For InfiniBand RDMA
+# UCX_TLS=tcp,cuda_copy # Fallback to TCP
 
 # Controller node
 lmcache_controller --host 0.0.0.0 --port 6000
 ```
+
+**Note:** The `nixl_backends` parameter here refers to NIXL's I/O backend (POSIX for files, GDS for GPU-direct file I/O). The actual network transport (RDMA vs TCP) is determined by UCX configuration.
 
 ### Disaggregated Prefill/Decode
 ```yaml
@@ -394,12 +432,13 @@ blocking_timeout_secs: 30
 
 ## Recommendations
 
-### For Maximum Performance (RDMA available):
+### For Maximum Performance (RDMA hardware available):
 ```
-Use P2P Backend with NIXL + GDS/RDMA
-- Lowest latency for cross-node
-- Near-local performance
+Use P2P Backend with NIXL + GPUDirect RDMA
+- Lowest latency for cross-node transfers
+- Near-local performance (10-100 GB/s)
 - Requires InfiniBand/RoCE NICs
+- Set UCX_TLS=rc,cuda_copy (InfiniBand) or UCX_TLS=tcp,cuda_copy (fallback)
 ```
 
 ### For Disaggregated Serving:
